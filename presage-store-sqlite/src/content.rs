@@ -562,19 +562,26 @@ impl ContentsStore for SqliteStore {
             about_emoji,
             avatar,
             unrestricted_unidentified_access,
+            payment_address,
         } = profile;
         let (given_name, family_name) = name.map(|n| (n.given_name, n.family_name)).unzip();
         let family_name = family_name.flatten();
-        query!(
-            "INSERT OR REPLACE INTO profiles VALUES (?, ?, ?, ?, ?, ?, ?)",
-            uuid,
-            given_name,
-            family_name,
-            about,
-            about_emoji,
-            avatar,
-            unrestricted_unidentified_access,
+        // Runtime-checked query: the sqlx offline cache doesn't cover the
+        // payment_address column added by our migration.
+        sqlx::query(
+            "INSERT OR REPLACE INTO profiles (
+                uuid, given_name, family_name, about, about_emoji, avatar,
+                unrestricted_unidentified_access, payment_address
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(uuid)
+        .bind(given_name)
+        .bind(family_name)
+        .bind(about)
+        .bind(about_emoji)
+        .bind(avatar)
+        .bind(unrestricted_unidentified_access)
+        .bind(payment_address)
         .execute(&self.db)
         .await?;
         Ok(())
@@ -586,21 +593,23 @@ impl ContentsStore for SqliteStore {
         key: ProfileKey,
     ) -> Result<Option<Profile>, Self::ContentsStoreError> {
         let profile_key_bytes = key.bytes.as_slice();
-        let profile = query_as!(
-            SqlProfile,
+        // Runtime-checked query: the sqlx offline cache doesn't cover the
+        // payment_address column added by our migration.
+        let profile = sqlx::query_as::<_, SqlProfile>(
             "SELECT
                 p.given_name,
                 p.family_name,
                 p.about,
                 p.about_emoji,
                 p.avatar,
-                p.unrestricted_unidentified_access
+                p.unrestricted_unidentified_access,
+                p.payment_address
             FROM profile_keys pk
             INNER JOIN profiles p ON p.uuid = pk.uuid
             WHERE pk.uuid = ? AND pk.key = ?",
-            uuid,
-            profile_key_bytes,
         )
+        .bind(uuid)
+        .bind(profile_key_bytes)
         .fetch_optional(&self.db)
         .await?;
         Ok(profile.map(|p| p.into()))
