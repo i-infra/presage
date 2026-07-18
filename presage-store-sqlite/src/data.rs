@@ -81,7 +81,7 @@ impl TryInto<Contact> for SqlContact {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, sqlx::FromRow)]
 pub struct SqlProfile {
     pub given_name: Option<String>,
     pub family_name: Option<String>,
@@ -89,6 +89,7 @@ pub struct SqlProfile {
     pub about_emoji: Option<String>,
     pub avatar: Option<String>,
     pub unrestricted_unidentified_access: bool,
+    pub payment_address: Option<Vec<u8>>,
 }
 
 impl From<SqlProfile> for Profile {
@@ -100,6 +101,7 @@ impl From<SqlProfile> for Profile {
             about_emoji,
             avatar,
             unrestricted_unidentified_access,
+            payment_address,
         }: SqlProfile,
     ) -> Self {
         Profile {
@@ -111,6 +113,7 @@ impl From<SqlProfile> for Profile {
             about_emoji,
             avatar,
             unrestricted_unidentified_access,
+            payment_address,
         }
     }
 }

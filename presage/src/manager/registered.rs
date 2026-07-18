@@ -18,19 +18,21 @@ use libsignal_service::{
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
     prelude::{phonenumber::PhoneNumber, MessageSenderError, ProtobufMessage, Uuid},
     profile_cipher::ProfileCipher,
+    profile_name::ProfileName,
     proto::{
         data_message::Delete,
+        payment_address,
         sync_message::{
             self, sticker_pack_operation, Content as SyncContent, StickerPackOperation,
         },
-        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, NullMessage, SyncMessage,
-        Verified,
+        AttachmentPointer, DataMessage, EditMessage, GroupContextV2, NullMessage, PaymentAddress,
+        SyncMessage, Verified,
     },
     protocol::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
     },
     provisioning::ProvisioningError,
-    push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
+    push_service::{AvatarWrite, PushService, ServiceIds, DEFAULT_DEVICE_ID},
     receiver::MessageReceiver,
     sender::{AttachmentSpec, AttachmentUploadError},
     sticker_cipher::derive_key,
@@ -71,6 +73,18 @@ type MessageSender<S> = libsignal_service::prelude::MessageSender<S>;
 pub enum RegistrationType {
     Primary,
     Secondary,
+}
+
+/// What to do with the profile avatar in
+/// [`Manager::update_profile_extended`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AvatarUpdate {
+    /// Keep the currently set avatar.
+    Retain,
+    /// Remove any currently set avatar.
+    Clear,
+    /// Encrypt and upload a new avatar image.
+    Set(Vec<u8>),
 }
 
 /// Manager state when the client is registered and can send and receive messages from Signal
@@ -451,6 +465,120 @@ impl<S: Store> Manager<S, Registered> {
             .await;
 
         Ok(())
+    }
+
+    /// Updates the user's full profile: name, about, emoji, avatar, and
+    /// MobileCoin payment address.
+    ///
+    /// A profile write replaces the whole profile server-side: passing
+    /// `payment_address: None` clears any stored address (retrieve your own
+    /// profile first and pass its address back to retain it — see
+    /// [`Self::sign_payment_address`] / [`Profile::payment_address`]).
+    ///
+    /// Returns the avatar CDN key when a new avatar was uploaded.
+    pub async fn update_profile_extended(
+        &mut self,
+        name: ProfileName<String>,
+        about: Option<String>,
+        emoji: Option<String>,
+        avatar: AvatarUpdate,
+        payment_address: Option<PaymentAddress>,
+    ) -> Result<Option<String>, Error<S::Error>> {
+        let aci = self.state.data.service_ids.aci();
+        let mut account_manager = AccountManager::new(
+            self.identified_push_service(),
+            self.identified_websocket(false).await?,
+            Some(self.state.data.profile_key),
+        );
+
+        let avatar_key = match avatar {
+            AvatarUpdate::Set(bytes) => {
+                let mut cursor = std::io::Cursor::new(bytes);
+                account_manager
+                    .upload_versioned_profile::<_, _, String>(
+                        aci,
+                        name,
+                        about,
+                        emoji,
+                        payment_address.as_ref(),
+                        AvatarWrite::NewAvatar(&mut cursor),
+                        &mut rand::rng(),
+                    )
+                    .await?
+            },
+            AvatarUpdate::Retain | AvatarUpdate::Clear => {
+                account_manager
+                    .upload_versioned_profile::<std::io::Cursor<Vec<u8>>, _, String>(
+                        aci,
+                        name,
+                        about,
+                        emoji,
+                        payment_address.as_ref(),
+                        if matches!(avatar, AvatarUpdate::Retain) {
+                            AvatarWrite::RetainAvatar
+                        } else {
+                            AvatarWrite::NoAvatar
+                        },
+                        &mut rand::rng(),
+                    )
+                    .await?
+            },
+        };
+
+        // Retrieve and save locally so we have the updated version
+        let profile = account_manager.retrieve_profile(aci).await?;
+        let _ = self
+            .store
+            .save_profile(aci.into(), self.state.data.profile_key, profile)
+            .await;
+
+        Ok(avatar_key)
+    }
+
+    /// Builds a signed [`PaymentAddress`] for a raw MobileCoin public
+    /// address, signing it with our ACI identity key as Signal clients do.
+    pub async fn sign_payment_address(
+        &mut self,
+        mobilecoin_public_address: &[u8],
+    ) -> Result<PaymentAddress, Error<S::Error>> {
+        let key_pair = self
+            .store
+            .aci_protocol_store()
+            .get_identity_key_pair()
+            .await?;
+        let signature = key_pair
+            .private_key()
+            .calculate_signature(mobilecoin_public_address, &mut rand::rng())
+            .map_err(libsignal_service::protocol::SignalProtocolError::from)?;
+        Ok(PaymentAddress {
+            address: Some(payment_address::Address::MobileCoin(
+                payment_address::MobileCoin {
+                    public_address: Some(mobilecoin_public_address.to_vec()),
+                    signature: Some(signature.into_vec()),
+                },
+            )),
+        })
+    }
+
+    /// Fetches the profile of the provided user, bypassing the local profile
+    /// cache, and refreshes the cache with the result.
+    pub async fn retrieve_profile_by_uuid_uncached(
+        &mut self,
+        aci: impl Into<Aci>,
+        profile_key: ProfileKey,
+    ) -> Result<Profile, Error<S::Error>> {
+        let aci = aci.into();
+        let mut account_manager = AccountManager::new(
+            self.identified_push_service(),
+            self.identified_websocket(false).await?,
+            Some(profile_key),
+        );
+        let profile = account_manager.retrieve_profile(aci).await?;
+        let _ = self
+            .store
+            .save_profile(aci.into(), profile_key, profile.clone())
+            .await;
+        Ok(profile)
     }
 
     pub async fn retrieve_group_avatar(
