@@ -213,6 +213,39 @@ impl StateStore for SqliteStore {
         Ok(())
     }
 
+    async fn username_data(
+        &self,
+    ) -> Result<Option<presage::store::UsernameData>, Self::StateStoreError> {
+        // Runtime-checked query: key added after the sqlx offline cache.
+        sqlx::query_scalar::<_, Vec<u8>>("SELECT value FROM kv WHERE key = 'username' LIMIT 1")
+            .fetch_optional(&self.db)
+            .await?
+            .map(|value| serde_json::from_slice(&value))
+            .transpose()
+            .map_err(From::from)
+    }
+
+    async fn save_username_data(
+        &self,
+        data: Option<&presage::store::UsernameData>,
+    ) -> Result<(), Self::StateStoreError> {
+        match data {
+            Some(data) => {
+                let value = serde_json::to_string(data)?;
+                sqlx::query("INSERT OR REPLACE INTO kv (key, value) VALUES ('username', ?)")
+                    .bind(value)
+                    .execute(&self.db)
+                    .await?;
+            }
+            None => {
+                sqlx::query("DELETE FROM kv WHERE key = 'username'")
+                    .execute(&self.db)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn fetch_master_key(&self) -> Result<Option<MasterKey>, Self::StateStoreError> {
         query_scalar!("SELECT value FROM kv WHERE key = 'master_key' LIMIT 1")
             .fetch_optional(&self.db)

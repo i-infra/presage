@@ -58,7 +58,7 @@ use url::Url;
 
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
-use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
+use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread, UsernameData};
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
 
 pub use crate::model::messages::Received;
@@ -568,6 +568,80 @@ impl<S: Store> Manager<S, Registered> {
                 },
             )),
         })
+    }
+
+    /// Sets the account's username and creates its shareable link, mirroring
+    /// signal-cli's flow: reserve → confirm-with-proof-and-link-blob.
+    ///
+    /// `username` is either a bare nickname (`ada`), in which case candidate
+    /// discriminators are generated and the server picks a free one, or a
+    /// full `nickname.discriminator` (`ada.42`), which is reserved exactly.
+    /// Re-setting the currently held username reclaims the existing link
+    /// entropy so the link URL stays stable.
+    pub async fn set_username(
+        &mut self,
+        username: &str,
+    ) -> Result<UsernameData, Error<S::Error>> {
+        use libsignal_service::protocol::NicknameLimits;
+
+        let mut candidates = if username.contains('.') {
+            vec![Username::new(username)?]
+        } else {
+            Username::candidates_from(
+                &mut rand::rng(),
+                username,
+                NicknameLimits::default(),
+            )?
+            .iter()
+            .map(|candidate| Username::new(candidate))
+            .collect::<Result<_, _>>()?
+        };
+
+        // Keep the link URL stable when the account re-confirms the username
+        // it already holds.
+        let current = self.store.username_data().await.ok().flatten();
+        let reclaim_entropy = current
+            .filter(|data| {
+                candidates.len() == 1
+                    && candidates[0].to_string() == data.username
+            })
+            .and_then(|data| {
+                <[u8; 32]>::try_from(data.link_entropy.as_slice()).ok()
+            });
+
+        let mut ws = self.identified_websocket(false).await?;
+        let index = ws.reserve_username(&candidates).await?;
+        let username = candidates.swap_remove(index);
+        let confirmed = ws
+            .confirm_username(username, reclaim_entropy.as_ref())
+            .await?;
+
+        let data = UsernameData {
+            username: confirmed.username.to_string(),
+            link_entropy: confirmed.link_entropy.to_vec(),
+            link_handle: confirmed.link_handle,
+        };
+        self.store
+            .save_username_data(Some(&data))
+            .await
+            .map_err(Error::Store)?;
+        Ok(data)
+    }
+
+    /// Clears the account's username and link, server-side and locally.
+    pub async fn delete_username(&mut self) -> Result<(), Error<S::Error>> {
+        let mut ws = self.identified_websocket(false).await?;
+        ws.delete_username().await?;
+        self.store
+            .save_username_data(None)
+            .await
+            .map_err(Error::Store)?;
+        Ok(())
+    }
+
+    /// The locally stored username and link components, if any.
+    pub async fn username(&self) -> Result<Option<UsernameData>, Error<S::Error>> {
+        self.store.username_data().await.map_err(Error::Store)
     }
 
     /// Fetches the profile of the provided user, bypassing the local profile

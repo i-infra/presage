@@ -82,6 +82,17 @@ pub trait StateStore {
         master_key: Option<&MasterKey>,
     ) -> impl Future<Output = Result<(), Self::StateStoreError>>;
 
+    /// The account's confirmed username and link components, if any.
+    fn username_data(
+        &self,
+    ) -> impl Future<Output = Result<Option<UsernameData>, Self::StateStoreError>>;
+
+    /// Persist (`Some`) or clear (`None`) the account's username data.
+    fn save_username_data(
+        &self,
+        data: Option<&UsernameData>,
+    ) -> impl Future<Output = Result<(), Self::StateStoreError>>;
+
     fn fetch_account_entropy_pool(
         &self,
     ) -> impl Future<Output = Result<Option<AccountEntropyPool>, Self::StateStoreError>>;
@@ -541,6 +552,29 @@ impl ContentExt for Content {
             }) => ts,
             _ => self.metadata.timestamp.timestamp_millis() as u64,
         }
+    }
+}
+
+/// The account's confirmed username and the components of its shareable
+/// `https://signal.me/#eu/...` link (entropy is the client-kept secret,
+/// the handle is server-assigned).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsernameData {
+    pub username: String,
+    pub link_entropy: Vec<u8>,
+    pub link_handle: Uuid,
+}
+
+impl UsernameData {
+    /// The shareable `https://signal.me/#eu/...` URL.
+    pub fn link(&self) -> Option<url::Url> {
+        let entropy: [u8; 32] = self.link_entropy.as_slice().try_into().ok()?;
+        Some(
+            libsignal_service::websocket::usernames::generate_username_link(
+                self.link_handle,
+                &entropy,
+            ),
+        )
     }
 }
 
