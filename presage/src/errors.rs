@@ -57,10 +57,23 @@ pub enum Error<S: std::error::Error> {
     ParseContactError(#[from] ParseContactError),
     #[error("failed to decrypt attachment: {0}")]
     AttachmentCipherError(#[from] libsignal_service::attachment_cipher::AttachmentCipherError),
+    #[error("group encryption/decryption failed: {0}")]
+    GroupDecodingError(#[from] libsignal_service::groups_v2::GroupDecodingError),
     #[error("unknown group")]
     UnknownGroup,
     #[error("unknown recipient")]
     UnknownRecipient,
+    /// Refused to leave a group that would be left without an administrator.
+    ///
+    /// Promote another member first, or pass `force` to leave anyway.
+    #[error("refusing to leave group as its last admin")]
+    LastGroupAdmin,
+    /// The groups server refused to let us read the group.
+    ///
+    /// Group reads authenticate with a membership proof, so this means we are
+    /// not a member — typically because we already left.
+    #[error("not a member of this group")]
+    NotAGroupMember,
     #[error("timeout: {0}")]
     Timeout(#[from] tokio::time::error::Elapsed),
     #[error("store error: {0}")]
