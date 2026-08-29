@@ -15,8 +15,9 @@ use libsignal_service::{
     content::{Content, ContentBody, Metadata},
     encrypt_device_name,
     groups_v2::{
-        decrypt_group, AccessControl, AccessRequired, GroupMemberCandidate, GroupOperations,
-        GroupsManager, InMemoryCredentialsCache, Role, Timer,
+        decrypt_group, AccessControl, AccessRequired, GroupInviteLink, GroupJoinInfo,
+        GroupLogEntry, GroupMemberCandidate, GroupOperations, GroupsManager,
+        InMemoryCredentialsCache, ProfileKeyCredentialCache, Role, Timer,
     },
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
     prelude::{phonenumber::PhoneNumber, MasterKey, MessageSenderError, ProtobufMessage, Uuid},
@@ -33,6 +34,7 @@ use libsignal_service::{
         Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, ServiceIdKind, Username,
     },
     provisioning::ProvisioningError,
+    push_service::ServiceError,
     push_service::{AvatarWrite, PushService, ServiceIds, DEFAULT_DEVICE_ID},
     receiver::MessageReceiver,
     sender::{AttachmentSpec, AttachmentUploadError},
@@ -44,10 +46,9 @@ use libsignal_service::{
         account::{AccountAttributes, DeviceCapabilities, DeviceInfo, WhoAmIResponse},
         SignalWebSocket,
     },
-    push_service::ServiceError,
     zkgroup::{
         groups::{GroupMasterKey, GroupSecretParams},
-        profiles::ProfileKey,
+        profiles::{ExpiringProfileKeyCredential, ProfileKey},
         GroupMasterKeyBytes,
     },
     AccountManager, Profile, ServiceIdExt,
@@ -64,7 +65,9 @@ use url::Url;
 
 use crate::model::contacts::Contact;
 use crate::serde::serde_profile_key;
-use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread, UsernameData};
+use crate::store::{
+    ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread, UsernameData,
+};
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
 
 pub use crate::model::messages::Received;
@@ -98,6 +101,10 @@ pub struct Registered {
     pub(crate) identified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Identified>>>>,
     pub(crate) unidentified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Unidentified>>>>,
     pub(crate) unidentified_sender_certificate: Arc<Mutex<Option<SenderCertificate>>>,
+    /// Profile key credentials by ACI. Each is good for up to a week, and
+    /// fetching one is a round trip per member per group change, so bulk adds
+    /// and repeated self-credential lookups lean on this.
+    pub(crate) profile_key_credentials: Arc<Mutex<ProfileKeyCredentialCache>>,
 
     pub(crate) data: Arc<RegistrationData>,
 }
@@ -116,6 +123,7 @@ impl Registered {
             identified_websocket: Default::default(),
             unidentified_websocket: Default::default(),
             unidentified_sender_certificate: Default::default(),
+            profile_key_credentials: Default::default(),
             data: Arc::new(data),
         }
     }
@@ -522,7 +530,7 @@ impl<S: Store> Manager<S, Registered> {
                         &mut rand::rng(),
                     )
                     .await?
-            },
+            }
             AvatarUpdate::Retain | AvatarUpdate::Clear => {
                 account_manager
                     .upload_versioned_profile::<std::io::Cursor<Vec<u8>>, _, String>(
@@ -539,7 +547,7 @@ impl<S: Store> Manager<S, Registered> {
                         &mut rand::rng(),
                     )
                     .await?
-            },
+            }
         };
 
         // Retrieve and save locally so we have the updated version
@@ -585,36 +593,24 @@ impl<S: Store> Manager<S, Registered> {
     /// full `nickname.discriminator` (`ada.42`), which is reserved exactly.
     /// Re-setting the currently held username reclaims the existing link
     /// entropy so the link URL stays stable.
-    pub async fn set_username(
-        &mut self,
-        username: &str,
-    ) -> Result<UsernameData, Error<S::Error>> {
+    pub async fn set_username(&mut self, username: &str) -> Result<UsernameData, Error<S::Error>> {
         use libsignal_service::protocol::NicknameLimits;
 
         let mut candidates = if username.contains('.') {
             vec![Username::new(username)?]
         } else {
-            Username::candidates_from(
-                &mut rand::rng(),
-                username,
-                NicknameLimits::default(),
-            )?
-            .iter()
-            .map(|candidate| Username::new(candidate))
-            .collect::<Result<_, _>>()?
+            Username::candidates_from(&mut rand::rng(), username, NicknameLimits::default())?
+                .iter()
+                .map(|candidate| Username::new(candidate))
+                .collect::<Result<_, _>>()?
         };
 
         // Keep the link URL stable when the account re-confirms the username
         // it already holds.
         let current = self.store.username_data().await.ok().flatten();
         let reclaim_entropy = current
-            .filter(|data| {
-                candidates.len() == 1
-                    && candidates[0].to_string() == data.username
-            })
-            .and_then(|data| {
-                <[u8; 32]>::try_from(data.link_entropy.as_slice()).ok()
-            });
+            .filter(|data| candidates.len() == 1 && candidates[0].to_string() == data.username)
+            .and_then(|data| <[u8; 32]>::try_from(data.link_entropy.as_slice()).ok());
 
         let mut ws = self.identified_websocket(false).await?;
         let index = ws.reserve_username(&candidates).await?;
@@ -1469,8 +1465,8 @@ impl<S: Store> Manager<S, Registered> {
 
         // A credential for ourselves is required — the server rejects a
         // creation whose creator has no profile key presentation.
-        let self_credential = groups_manager
-            .fetch_profile_key_credential(&mut csprng, self_aci, self_profile_key)
+        let self_credential = self
+            .profile_key_credential(&mut groups_manager, &mut csprng, self_aci, self_profile_key)
             .await?
             .ok_or(Error::UnknownRecipient)?;
 
@@ -1499,7 +1495,10 @@ impl<S: Store> Manager<S, Registered> {
             Some(&access_control),
             &self_credential,
             &candidates,
-            &self.state.service_configuration().zkgroup_server_public_params,
+            &self
+                .state
+                .service_configuration()
+                .zkgroup_server_public_params,
             String::new(),
             &mut csprng,
         )?;
@@ -1569,6 +1568,42 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// A profile key credential for `aci`, from cache when a fresh one is
+    /// held, otherwise fetched and cached.
+    ///
+    /// `Ok(None)` means the server declined — our profile key for them is
+    /// stale — and is deliberately not cached, since a profile refresh may
+    /// fix it at any moment.
+    async fn profile_key_credential<R: RngCore + rand::CryptoRng>(
+        &self,
+        groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+        csprng: &mut R,
+        aci: Aci,
+        profile_key: ProfileKey,
+    ) -> Result<Option<ExpiringProfileKeyCredential>, Error<S::Error>> {
+        let now = SystemTime::now();
+        {
+            let mut cache = self.state.profile_key_credentials.lock().await;
+            cache.evict_expired(now);
+            if let Some(credential) = cache.get(&aci, now) {
+                trace!(aci = %aci.service_id_string(), "profile key credential from cache");
+                return Ok(Some(*credential));
+            }
+        }
+
+        let credential = groups_manager
+            .fetch_profile_key_credential(csprng, aci, profile_key)
+            .await?;
+        if let Some(credential) = credential {
+            self.state
+                .profile_key_credentials
+                .lock()
+                .await
+                .insert(aci, credential);
+        }
+        Ok(credential)
+    }
+
     /// Resolves service IDs into group member candidates, fetching a profile
     /// key credential for each where possible.
     ///
@@ -1600,8 +1635,8 @@ impl<S: Store> Manager<S, Registered> {
             ) {
                 (ServiceIdKind::Aci, Some(profile_key)) => {
                     let aci = Aci::from(service_id.raw_uuid());
-                    match groups_manager
-                        .fetch_profile_key_credential(csprng, aci, profile_key)
+                    match self
+                        .profile_key_credential(groups_manager, csprng, aci, profile_key)
                         .await
                     {
                         Ok(credential) => credential,
@@ -1762,11 +1797,7 @@ impl<S: Store> Manager<S, Registered> {
         description: Option<&str>,
     ) -> Result<(), Error<S::Error>> {
         self.modify_group(master_key_bytes, |_, operations, revision| {
-            Ok(operations.build_modify_description_actions(
-                description,
-                revision,
-                &mut rng(),
-            ))
+            Ok(operations.build_modify_description_actions(description, revision, &mut rng()))
         })
         .await?;
 
@@ -1780,11 +1811,7 @@ impl<S: Store> Manager<S, Registered> {
         timer: Option<Timer>,
     ) -> Result<(), Error<S::Error>> {
         self.modify_group(master_key_bytes, |_, operations, revision| {
-            Ok(operations.build_modify_timer_actions(
-                timer.as_ref(),
-                revision,
-                &mut rng(),
-            ))
+            Ok(operations.build_modify_timer_actions(timer.as_ref(), revision, &mut rng()))
         })
         .await?;
 
@@ -1829,8 +1856,8 @@ impl<S: Store> Manager<S, Registered> {
             .ok_or(Error::UnknownRecipient)?;
 
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
-        let self_credential = groups_manager
-            .fetch_profile_key_credential(&mut csprng, self_aci, self_profile_key)
+        let self_credential = self
+            .profile_key_credential(&mut groups_manager, &mut csprng, self_aci, self_profile_key)
             .await?
             .ok_or(Error::UnknownRecipient)?;
 
@@ -1859,6 +1886,315 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// Sets (or, with `None`, clears) the group avatar.
+    ///
+    /// The image is encrypted under the group's key and uploaded to the
+    /// groups CDN first; the change then only references the returned key.
+    /// Signal's clients accept JPEG/PNG/WebP of a few hundred KB — the
+    /// server does not validate the bytes, so a bad image simply fails to
+    /// render on other devices.
+    pub async fn set_group_avatar(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        avatar: Option<&[u8]>,
+    ) -> Result<(), Error<S::Error>> {
+        let avatar_key = match avatar {
+            Some(bytes) => {
+                let mut csprng = rng();
+                let group_secret_params = GroupSecretParams::derive_from_master_key(
+                    GroupMasterKey::new(*master_key_bytes),
+                );
+                let mut groups_manager = Box::pin(self.groups_manager()).await?;
+                groups_manager
+                    .upload_group_avatar(&mut csprng, group_secret_params, bytes)
+                    .await?
+            }
+            None => String::new(),
+        };
+
+        self.modify_group(master_key_bytes, |_group, operations, revision| {
+            Ok(operations.build_modify_avatar_actions(&avatar_key, revision))
+        })
+        .await?;
+
+        // Keep the local cache in step so the next read does not re-download
+        // (or, when cleared, keep serving) the old image.
+        let _ = self
+            .store
+            .save_group_avatar(
+                *master_key_bytes,
+                &avatar.map(<[u8]>::to_vec).unwrap_or_default(),
+            )
+            .await;
+        Ok(())
+    }
+
+    /// The group's change history from `from_revision` onward (all of it we
+    /// are allowed to see, when `None`).
+    ///
+    /// The server only serves history from the revision we joined at, so an
+    /// earlier `from_revision` is clamped up rather than rejected. Pages are
+    /// followed transparently; the first entry carries the full group state
+    /// as of that revision.
+    pub async fn group_history(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        from_revision: Option<u32>,
+    ) -> Result<Vec<GroupLogEntry>, Error<S::Error>> {
+        let self_aci = self.state.data.service_ids.aci();
+        let mut csprng = rng();
+        let group_secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(*master_key_bytes));
+        let operations = GroupOperations::new(group_secret_params);
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+
+        let group = match groups_manager
+            .fetch_encrypted_group(&mut csprng, master_key_bytes)
+            .await
+        {
+            Ok(encrypted) => decrypt_group(master_key_bytes, encrypted)?,
+            Err(ServiceError::Unauthorized) => return Err(Error::NotAGroupMember),
+            Err(error) => return Err(error.into()),
+        };
+        let joined_at = group
+            .members
+            .iter()
+            .find(|m| m.aci == self_aci)
+            .map(|m| m.joined_at_version)
+            .ok_or(Error::NotAGroupMember)?;
+        let mut from = from_revision.unwrap_or(0).max(joined_at);
+
+        let mut entries = Vec::new();
+        loop {
+            let page = groups_manager
+                .fetch_group_logs(&mut csprng, group_secret_params, from, entries.is_empty())
+                .await?;
+            entries.extend(operations.decrypt_group_logs(page.changes)?);
+            match page.next_revision {
+                Some(next) if next > from => from = next,
+                _ => break,
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Configures the group's invite link and returns it when enabled.
+    ///
+    /// Enabling generates a password if the group never had one;
+    /// `reset_password` forces a new one, invalidating every previously
+    /// shared link. Disabling keeps the password, so re-enabling later
+    /// revives the old links unless reset.
+    pub async fn set_group_invite_link(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        access: GroupInviteLinkAccess,
+        reset_password: bool,
+    ) -> Result<Option<String>, Error<S::Error>> {
+        let group = self
+            .modify_group(master_key_bytes, |group, operations, revision| {
+                let wanted = access.as_access_required();
+                let current = group
+                    .access_control
+                    .as_ref()
+                    .map(|ac| ac.add_from_invite_link)
+                    .unwrap_or(AccessRequired::Unsatisfiable);
+                let access_change = (wanted != current).then_some(wanted);
+
+                let needs_password = access != GroupInviteLinkAccess::Disabled
+                    && group.invite_link_password.is_empty();
+                let password = (reset_password || needs_password)
+                    .then(|| GroupInviteLink::generate_password(&mut rng()));
+
+                Ok(operations.build_modify_invite_link_actions(
+                    access_change,
+                    password.as_deref(),
+                    revision,
+                ))
+            })
+            .await?;
+
+        Ok(invite_link_for(master_key_bytes, &group))
+    }
+
+    /// The group's current invite link, if links are enabled.
+    pub async fn group_invite_link(
+        &self,
+        master_key_bytes: &GroupMasterKeyBytes,
+    ) -> Result<Option<String>, Error<S::Error>> {
+        let Some(group) = self.store.group(*master_key_bytes).await? else {
+            return Err(Error::UnknownGroup);
+        };
+        let enabled = matches!(
+            group
+                .access_control
+                .as_ref()
+                .map(|ac| ac.add_from_invite_link),
+            Some(AccessRequired::Any | AccessRequired::Administrator)
+        ) && !group.invite_link_password.is_empty();
+        Ok(enabled.then(|| {
+            GroupInviteLink {
+                master_key: *master_key_bytes,
+                password: group.invite_link_password.clone(),
+            }
+            .to_url()
+        }))
+    }
+
+    /// What an invite link leads to, without joining.
+    pub async fn group_join_info(
+        &mut self,
+        invite_link: &str,
+    ) -> Result<GroupJoinInfo, Error<S::Error>> {
+        let link = GroupInviteLink::parse(invite_link)?;
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        groups_manager
+            .fetch_group_join_info(&mut rng(), &link)
+            .await
+            .map_err(invite_link_error)
+    }
+
+    /// Joins a group through its invite link.
+    ///
+    /// Whether this makes us a member outright or files a join request
+    /// depends on the group's setting; the outcome says which. A group we
+    /// are already in is reported as `Joined` without a change. Announcing
+    /// a *request* is not possible from outside the group (we cannot see
+    /// the members to notify), so admins learn of it when their client next
+    /// syncs group state.
+    pub async fn join_group_via_invite_link(
+        &mut self,
+        invite_link: &str,
+    ) -> Result<JoinGroupOutcome, Error<S::Error>> {
+        const MAX_ATTEMPTS: usize = 3;
+
+        let link = GroupInviteLink::parse(invite_link)?;
+        let master_key_bytes = link.master_key;
+        let self_aci = self.state.data.service_ids.aci();
+        let mut csprng = rng();
+        let group_secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key_bytes));
+        let operations = GroupOperations::new(group_secret_params);
+        let server_public_params = self
+            .state
+            .service_configuration()
+            .zkgroup_server_public_params;
+
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+
+        // Already a member? Then the group is readable, and joining again
+        // would be rejected.
+        if let Ok(encrypted) = groups_manager
+            .fetch_encrypted_group(&mut csprng, &master_key_bytes)
+            .await
+        {
+            let group = decrypt_group(&master_key_bytes, encrypted)?;
+            if group.members.iter().any(|m| m.aci == self_aci) {
+                self.store.save_group(master_key_bytes, group).await?;
+                return Ok(JoinGroupOutcome::Joined(master_key_bytes));
+            }
+        }
+
+        let self_profile_key = self
+            .store
+            .profile_key(&self_aci.into())
+            .await?
+            .ok_or(Error::UnknownRecipient)?;
+        let self_credential = self
+            .profile_key_credential(&mut groups_manager, &mut csprng, self_aci, self_profile_key)
+            .await?
+            .ok_or(Error::UnknownRecipient)?;
+
+        let mut last_error = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            let info = groups_manager
+                .fetch_group_join_info(&mut csprng, &link)
+                .await
+                .map_err(invite_link_error)?;
+            let requires_approval = match info.add_from_invite_link {
+                AccessRequired::Any => false,
+                AccessRequired::Administrator => true,
+                _ => return Err(Error::InviteLinkRevoked),
+            };
+
+            let actions = operations.build_join_via_invite_link_actions(
+                &server_public_params,
+                &self_credential,
+                requires_approval,
+                info.version + 1,
+            );
+
+            match groups_manager
+                .patch_encrypted_group_via_invite_link(&mut csprng, &link, actions)
+                .await
+            {
+                Ok(signed_change) => {
+                    if requires_approval {
+                        return Ok(JoinGroupOutcome::Requested(master_key_bytes));
+                    }
+                    let group = self
+                        .refresh_group_after_change(&master_key_bytes, &mut groups_manager)
+                        .await?;
+                    let recipients: Vec<ServiceId> = group
+                        .members
+                        .iter()
+                        .map(|m| ServiceId::from(m.aci))
+                        .filter(|id| *id != ServiceId::from(self_aci))
+                        .collect();
+                    if let Err(error) = self
+                        .announce_group_change(
+                            &master_key_bytes,
+                            info.version + 1,
+                            Some(signed_change.encode_to_vec()),
+                            recipients,
+                        )
+                        .await
+                    {
+                        warn!(%error, "joined group but announcement failed");
+                    }
+                    return Ok(JoinGroupOutcome::Joined(master_key_bytes));
+                }
+                Err(ServiceError::GroupPatchConflict) => {
+                    debug!(attempt, "join conflicted with another change, retrying");
+                    last_error = Some(ServiceError::GroupPatchConflict);
+                }
+                Err(error) => return Err(invite_link_error(error)),
+            }
+        }
+        Err(last_error.map(Error::from).unwrap_or(Error::UnknownGroup))
+    }
+
+    /// Approves pending join requests, making each requester a member.
+    /// Requesters not actually pending are skipped.
+    pub async fn approve_group_join_requests(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        requesters: impl IntoIterator<Item = Aci>,
+    ) -> Result<(), Error<S::Error>> {
+        let requested: Vec<Aci> = requesters.into_iter().collect();
+        self.modify_group(master_key_bytes, |group, operations, revision| {
+            let pending = pending_requesters(group, &requested);
+            Ok(operations.build_approve_join_requests_actions(pending, revision)?)
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Denies pending join requests. Requesters not actually pending are
+    /// skipped. Denying your own request withdraws it.
+    pub async fn deny_group_join_requests(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        requesters: impl IntoIterator<Item = Aci>,
+    ) -> Result<(), Error<S::Error>> {
+        let requested: Vec<Aci> = requesters.into_iter().collect();
+        self.modify_group(master_key_bytes, |group, operations, revision| {
+            let pending = pending_requesters(group, &requested);
+            Ok(operations.build_deny_join_requests_actions(pending, revision)?)
+        })
+        .await?;
+        Ok(())
+    }
+
     /// The canonical mutation path for group changes.
     ///
     /// Fetches authoritative state from the *server* (the local store may be
@@ -1878,10 +2214,7 @@ impl<S: Store> Manager<S, Registered> {
             &libsignal_service::groups_v2::Group,
             &GroupOperations,
             u32,
-        ) -> Result<
-            libsignal_service::proto::group_change::Actions,
-            Error<S::Error>,
-        >,
+        ) -> Result<libsignal_service::proto::group_change::Actions, Error<S::Error>>,
     {
         /// Bounded: a group under constant concurrent modification should
         /// surface the conflict rather than retry forever.
@@ -1984,7 +2317,10 @@ impl<S: Store> Manager<S, Registered> {
                     return Ok(updated.unwrap_or(group));
                 }
                 Err(ServiceError::GroupPatchConflict) => {
-                    debug!(attempt, "group change conflicted, rebuilding on newer revision");
+                    debug!(
+                        attempt,
+                        "group change conflicted, rebuilding on newer revision"
+                    );
                     last_conflict = Some(ServiceError::GroupPatchConflict);
                     continue;
                 }
@@ -2051,14 +2387,14 @@ impl<S: Store> Manager<S, Registered> {
 
         let mut targets = Vec::new();
         for service_id in recipients {
-            let unidentified_access = self
-                .store
-                .profile_key(&service_id)
-                .await?
-                .map(|profile_key| UnidentifiedAccess {
-                    key: profile_key.derive_access_key().to_vec(),
-                    certificate: sender_certificate.clone(),
-                });
+            let unidentified_access =
+                self.store
+                    .profile_key(&service_id)
+                    .await?
+                    .map(|profile_key| UnidentifiedAccess {
+                        key: profile_key.derive_access_key().to_vec(),
+                        certificate: sender_certificate.clone(),
+                    });
             targets.push((service_id, unidentified_access, false));
         }
 
@@ -2580,6 +2916,82 @@ fn ensure_data_message_timestamp(content_body: &mut ContentBody, timestamp: u64)
 /// comparison never match.
 ///
 /// [`Actions`]: libsignal_service::proto::group_change::Actions
+/// Who may join through the group's invite link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupInviteLinkAccess {
+    /// No link.
+    Disabled,
+    /// Anyone with the link becomes a member immediately.
+    Anyone,
+    /// Anyone with the link may request; an administrator must approve.
+    AdminApproval,
+}
+
+impl GroupInviteLinkAccess {
+    fn as_access_required(self) -> AccessRequired {
+        match self {
+            Self::Disabled => AccessRequired::Unsatisfiable,
+            Self::Anyone => AccessRequired::Any,
+            Self::AdminApproval => AccessRequired::Administrator,
+        }
+    }
+}
+
+/// Result of joining through an invite link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinGroupOutcome {
+    /// We are a member; the group is saved locally.
+    Joined(GroupMasterKeyBytes),
+    /// A join request is pending an administrator's approval.
+    Requested(GroupMasterKeyBytes),
+}
+
+fn invite_link_for(
+    master_key_bytes: &GroupMasterKeyBytes,
+    group: &libsignal_service::groups_v2::Group,
+) -> Option<String> {
+    let enabled = matches!(
+        group
+            .access_control
+            .as_ref()
+            .map(|ac| ac.add_from_invite_link),
+        Some(AccessRequired::Any | AccessRequired::Administrator)
+    ) && !group.invite_link_password.is_empty();
+    enabled.then(|| {
+        GroupInviteLink {
+            master_key: *master_key_bytes,
+            password: group.invite_link_password.clone(),
+        }
+        .to_url()
+    })
+}
+
+/// The subset of `requested` that currently has a join request open.
+fn pending_requesters(group: &libsignal_service::groups_v2::Group, requested: &[Aci]) -> Vec<Aci> {
+    requested
+        .iter()
+        .copied()
+        .filter(|aci| {
+            group
+                .members_pending_admin_approval
+                .iter()
+                .any(|r| r.aci == *aci)
+        })
+        .collect()
+}
+
+/// The groups server answers an unusable link with 403; surface that as the
+/// link being revoked rather than as a generic HTTP failure.
+fn invite_link_error<E: std::error::Error>(error: ServiceError) -> Error<E> {
+    match error {
+        ServiceError::Unauthorized => Error::InviteLinkRevoked,
+        ServiceError::UnhandledResponseCode { status, .. } if status.as_u16() == 403 => {
+            Error::InviteLinkRevoked
+        }
+        error => Error::ServiceError(error),
+    }
+}
+
 fn is_empty_change(actions: &libsignal_service::proto::group_change::Actions) -> bool {
     actions.add_members.is_empty()
         && actions.delete_members.is_empty()
@@ -2630,9 +3042,7 @@ fn would_orphan_group(
 ) -> bool {
     let self_service_id = ServiceId::from(self_aci);
     let others_remain = members.iter().any(|m| m.aci != self_aci)
-        || pending_members
-            .iter()
-            .any(|m| m.address != self_service_id);
+        || pending_members.iter().any(|m| m.address != self_service_id);
     let self_is_admin = members
         .iter()
         .any(|m| m.aci == self_aci && m.role == Role::Administrator);
@@ -3138,10 +3548,7 @@ mod tests {
 
     #[test]
     fn sole_admin_leaving_others_behind_orphans_the_group() {
-        let members = vec![
-            member(1, Role::Administrator),
-            member(2, Role::Default),
-        ];
+        let members = vec![member(1, Role::Administrator), member(2, Role::Default)];
         assert!(would_orphan_group(&members, &[], aci(1)));
     }
 
@@ -3176,5 +3583,84 @@ mod tests {
         // check that omitted "are we actually an admin" would wrongly refuse.
         let members = vec![member(1, Role::Default), member(2, Role::Default)];
         assert!(!would_orphan_group(&members, &[], aci(1)));
+    }
+
+    fn group_with(
+        access: AccessRequired,
+        password: &[u8],
+        requesters: Vec<u8>,
+    ) -> libsignal_service::groups_v2::Group {
+        libsignal_service::groups_v2::Group {
+            title: "g".into(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: Some(libsignal_service::groups_v2::AccessControl {
+                attributes: AccessRequired::Member,
+                members: AccessRequired::Member,
+                add_from_invite_link: access,
+                member_label: AccessRequired::Member,
+            }),
+            version: 3,
+            members: vec![member(1, Role::Administrator)],
+            members_pending_profile_key: vec![],
+            members_pending_admin_approval: requesters
+                .into_iter()
+                .map(|last| libsignal_service::groups_v2::RequestingMember {
+                    aci: aci(last),
+                    profile_key: ProfileKey::create([0u8; 32]),
+                    timestamp: 0,
+                })
+                .collect(),
+            invite_link_password: password.to_vec(),
+            description_text: None,
+            announcements_only: false,
+            members_banned: vec![],
+        }
+    }
+
+    #[test]
+    fn invite_link_requires_both_access_and_password() {
+        let key = [5u8; 32];
+        let password = [9u8; 16];
+        assert!(invite_link_for(
+            &key,
+            &group_with(AccessRequired::Unsatisfiable, &password, vec![])
+        )
+        .is_none());
+        assert!(invite_link_for(&key, &group_with(AccessRequired::Any, &[], vec![])).is_none());
+
+        let url = invite_link_for(
+            &key,
+            &group_with(AccessRequired::Administrator, &password, vec![]),
+        )
+        .expect("enabled link");
+        let parsed = GroupInviteLink::parse(&url).unwrap();
+        assert_eq!(parsed.master_key, key);
+        assert_eq!(parsed.password, password);
+    }
+
+    #[test]
+    fn join_request_decisions_only_touch_open_requests() {
+        let group = group_with(AccessRequired::Administrator, &[1], vec![7, 8]);
+        let pending = pending_requesters(&group, &[aci(7), aci(9)]);
+        assert_eq!(pending, vec![aci(7)]);
+        // Nobody pending → empty → modify_group's empty-change guard skips it.
+        assert!(pending_requesters(&group, &[aci(9)]).is_empty());
+    }
+
+    #[test]
+    fn invite_link_access_maps_to_server_values() {
+        assert_eq!(
+            GroupInviteLinkAccess::Disabled.as_access_required(),
+            AccessRequired::Unsatisfiable
+        );
+        assert_eq!(
+            GroupInviteLinkAccess::Anyone.as_access_required(),
+            AccessRequired::Any
+        );
+        assert_eq!(
+            GroupInviteLinkAccess::AdminApproval.as_access_required(),
+            AccessRequired::Administrator
+        );
     }
 }
