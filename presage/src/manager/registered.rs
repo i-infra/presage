@@ -14,7 +14,10 @@ use libsignal_service::{
     configuration::{ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, Metadata},
     encrypt_device_name,
-    groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
+    groups_v2::{
+        decrypt_group, AccessControl, AccessRequired, GroupMemberCandidate, GroupOperations,
+        GroupsManager, InMemoryCredentialsCache, Role, Timer,
+    },
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
     prelude::{phonenumber::PhoneNumber, MessageSenderError, ProtobufMessage, Uuid},
     profile_cipher::ProfileCipher,
@@ -43,16 +46,18 @@ use libsignal_service::{
         account::{AccountAttributes, DeviceCapabilities, DeviceInfo, WhoAmIResponse},
         SignalWebSocket,
     },
+    push_service::ServiceError,
     zkgroup::{
         groups::{GroupMasterKey, GroupSecretParams},
         profiles::ProfileKey,
+        GroupMasterKeyBytes,
     },
     AccountManager, Profile, ServiceIdExt,
 };
 use libsignal_service::{
     libsignal_account_keys::AccountEntropyPool, proto::addressable_message::Author,
 };
-use rand::rng;
+use rand::{rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::sync::Mutex;
@@ -761,6 +766,7 @@ impl<S: Store> Manager<S, Registered> {
         let groups_manager = GroupsManager::new(
             self.state.data.service_ids.clone(),
             self.identified_push_service(),
+            self.identified_websocket(false).await?,
             self.unidentified_websocket().await?,
             groups_credentials_cache,
             server_public_params,
@@ -1375,6 +1381,664 @@ impl<S: Store> Manager<S, Registered> {
         Ok(upload.await)
     }
 
+    /// Creates a new group (v2) and returns its master key.
+    ///
+    /// The master key is the group's handle for every other operation, and the
+    /// only thing that needs persisting: all group keys derive from it.
+    ///
+    /// You are added as the sole administrator. Each entry in `members` is
+    /// added as a full member if we hold a profile key for them and the server
+    /// issues a credential; otherwise they are *invited* as a pending member,
+    /// which they must accept before they appear as a full member. Invitees
+    /// count against the group size limit.
+    ///
+    /// Returns [`Error::UnknownRecipient`] if no profile key is known for
+    /// ourselves — a credential for self is mandatory at creation time.
+    pub async fn create_group(
+        &mut self,
+        title: &str,
+        description: Option<&str>,
+        members: impl IntoIterator<Item = ServiceId>,
+        timer: Option<Timer>,
+    ) -> Result<GroupMasterKeyBytes, Error<S::Error>> {
+        let mut csprng = rng();
+
+        // The master key is the group's identity; everything else derives from
+        // it. It must be random and is never sent to the server in the clear.
+        let mut master_key_bytes: GroupMasterKeyBytes = [0u8; 32];
+        csprng.fill_bytes(&mut master_key_bytes);
+        let group_secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key_bytes));
+
+        let self_aci = self.state.data.service_ids.aci();
+        let self_profile_key = self
+            .store
+            .profile_key(&self_aci.into())
+            .await?
+            .ok_or(Error::UnknownRecipient)?;
+
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+
+        // A credential for ourselves is required — the server rejects a
+        // creation whose creator has no profile key presentation.
+        let self_credential = groups_manager
+            .fetch_profile_key_credential(&mut csprng, self_aci, self_profile_key)
+            .await?
+            .ok_or(Error::UnknownRecipient)?;
+
+        // For everyone else a missing credential is not fatal: fall back to a
+        // pending invite, which is what Signal's own clients do.
+        let candidates = self
+            .resolve_member_candidates(&mut groups_manager, &mut csprng, members, self_aci)
+            .await?;
+
+        // Access control must be set explicitly: the server rejects a group
+        // that omits it. These are the defaults Signal's own clients use —
+        // any member may edit attributes and membership, and the invite link
+        // starts disabled (`Unsatisfiable`) until one is generated.
+        let access_control = AccessControl {
+            attributes: AccessRequired::Member,
+            members: AccessRequired::Member,
+            add_from_invite_link: AccessRequired::Unsatisfiable,
+            member_label: AccessRequired::Member,
+        };
+
+        let operations = GroupOperations::new(group_secret_params);
+        let encrypted_group = operations.encrypt_group_with_credentials(
+            title,
+            description,
+            timer.as_ref(),
+            Some(&access_control),
+            &self_credential,
+            &candidates,
+            &self.state.service_configuration().zkgroup_server_public_params,
+            String::new(),
+            &mut csprng,
+        )?;
+
+        groups_manager
+            .create_encrypted_group(&mut csprng, group_secret_params, encrypted_group.clone())
+            .await?;
+
+        // Persist immediately so the group is usable even if the announcement
+        // fan-out below fails.
+        let group = decrypt_group(&master_key_bytes, encrypted_group)?;
+        self.store.save_group(master_key_bytes, group).await?;
+
+        // Creation is announced with a group context carrying no change blob:
+        // recipients (including invitees) fetch the state themselves.
+        let recipients: Vec<ServiceId> = candidates
+            .iter()
+            .map(|candidate| candidate.service_id)
+            .collect();
+        if let Err(error) = self
+            .announce_group_change(&master_key_bytes, 0, None, recipients)
+            .await
+        {
+            warn!(%error, "group created but announcement failed; members will sync on next fetch");
+        }
+
+        Ok(master_key_bytes)
+    }
+
+    /// Leaves a group by removing yourself from it.
+    ///
+    /// Refuses with [`Error::LastGroupAdmin`] if you are the only administrator
+    /// and other members remain, unless `force` is set: the server permits an
+    /// admin-less group, but clients treat one as degraded — nobody can ever
+    /// change the title or membership again. Promote another member first.
+    pub async fn leave_group(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        force: bool,
+    ) -> Result<(), Error<S::Error>> {
+        let self_aci = self.state.data.service_ids.aci();
+
+        let mut group = self
+            .modify_group(master_key_bytes, |group, operations, revision| {
+                if !force
+                    && would_orphan_group(
+                        &group.members,
+                        &group.members_pending_profile_key,
+                        self_aci,
+                    )
+                {
+                    return Err(Error::LastGroupAdmin);
+                }
+
+                Ok(operations.build_leave_group_actions(self_aci, revision)?)
+            })
+            .await?;
+
+        // `modify_group` cannot refetch a group we just left, so it returns the
+        // pre-change state — which still lists us. Drop ourselves and bump the
+        // revision before saving, otherwise the store keeps claiming we are a
+        // member of a group we have left.
+        group.members.retain(|m| m.aci != self_aci);
+        group.version += 1;
+        self.store.save_group(*master_key_bytes, group).await?;
+
+        Ok(())
+    }
+
+    /// Resolves service IDs into group member candidates, fetching a profile
+    /// key credential for each where possible.
+    ///
+    /// A candidate with a credential can be added as a full member; one
+    /// without can only be invited. Failing to obtain a credential is
+    /// therefore never fatal here — it downgrades that person to an invite
+    /// rather than failing the whole operation. `self_aci` is skipped, since
+    /// you are never a candidate for your own group.
+    async fn resolve_member_candidates<R: RngCore + rand::CryptoRng>(
+        &self,
+        groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+        csprng: &mut R,
+        members: impl IntoIterator<Item = ServiceId>,
+        self_aci: Aci,
+    ) -> Result<Vec<GroupMemberCandidate>, Error<S::Error>> {
+        let self_service_id = ServiceId::from(self_aci);
+        let mut candidates = Vec::new();
+
+        for service_id in members {
+            if service_id == self_service_id {
+                continue;
+            }
+
+            // A PNI-only contact can never be a full member: credentials are
+            // issued against an ACI.
+            let credential = match (
+                service_id.kind(),
+                self.store.profile_key(&service_id).await?,
+            ) {
+                (ServiceIdKind::Aci, Some(profile_key)) => {
+                    let aci = Aci::from(service_id.raw_uuid());
+                    match groups_manager
+                        .fetch_profile_key_credential(csprng, aci, profile_key)
+                        .await
+                    {
+                        Ok(credential) => credential,
+                        Err(error) => {
+                            warn!(
+                                service_id = %service_id.service_id_string(),
+                                %error,
+                                "no profile key credential, inviting as pending member"
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+
+            candidates.push(GroupMemberCandidate {
+                service_id,
+                credential,
+            });
+        }
+
+        Ok(candidates)
+    }
+
+    /// Adds members to a group.
+    ///
+    /// Anyone whose profile key we hold is added as a full member; the rest
+    /// are invited and appear as pending until they accept. Someone who is
+    /// already a member or already invited is skipped rather than treated as
+    /// an error — re-adding is a no-op, not a failure.
+    pub async fn add_group_members(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        members: impl IntoIterator<Item = ServiceId>,
+    ) -> Result<(), Error<S::Error>> {
+        let self_aci = self.state.data.service_ids.aci();
+        let mut csprng = rng();
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+
+        let requested: Vec<ServiceId> = members.into_iter().collect();
+
+        // Filter against current state before spending a credential fetch on
+        // someone who is already in the group.
+        let group = {
+            let encrypted = groups_manager
+                .fetch_encrypted_group(&mut csprng, master_key_bytes)
+                .await
+                .map_err(|error| match error {
+                    ServiceError::Unauthorized => Error::NotAGroupMember,
+                    error => error.into(),
+                })?;
+            decrypt_group(master_key_bytes, encrypted)?
+        };
+
+        let already_present: std::collections::HashSet<ServiceId> = group
+            .members
+            .iter()
+            .map(|m| ServiceId::from(m.aci))
+            .chain(group.members_pending_profile_key.iter().map(|m| m.address))
+            .collect();
+
+        let to_add: Vec<ServiceId> = requested
+            .into_iter()
+            .filter(|id| !already_present.contains(id))
+            .collect();
+
+        if to_add.is_empty() {
+            debug!("all requested members are already in the group");
+            return Ok(());
+        }
+
+        let candidates = self
+            .resolve_member_candidates(&mut groups_manager, &mut csprng, to_add, self_aci)
+            .await?;
+
+        let server_public_params = self
+            .state
+            .service_configuration()
+            .zkgroup_server_public_params;
+
+        self.modify_group(master_key_bytes, move |_, operations, revision| {
+            Ok(operations.build_add_members_actions(
+                &server_public_params,
+                &candidates,
+                self_aci,
+                revision,
+            )?)
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Removes members from a group, revoking any outstanding invitation too.
+    ///
+    /// A target may be a full member, an invitee who has not accepted, or
+    /// neither; each needs different handling, so all three are resolved here
+    /// against current state. Targets in none of those states are skipped.
+    /// Note this does not ban them: with an invite link enabled they could
+    /// rejoin.
+    pub async fn remove_group_members(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        members: impl IntoIterator<Item = Aci>,
+    ) -> Result<(), Error<S::Error>> {
+        let requested: Vec<Aci> = members.into_iter().collect();
+
+        self.modify_group(master_key_bytes, move |group, operations, revision| {
+            let full_members: Vec<Aci> = requested
+                .iter()
+                .copied()
+                .filter(|aci| group.members.iter().any(|m| m.aci == *aci))
+                .collect();
+
+            // Pending entries are matched on the service ID they were invited
+            // under, which is whatever the inviter used.
+            let pending: Vec<ServiceId> = requested
+                .iter()
+                .map(|aci| ServiceId::from(*aci))
+                .filter(|id| {
+                    group
+                        .members_pending_profile_key
+                        .iter()
+                        .any(|m| m.address == *id)
+                })
+                .collect();
+
+            Ok(operations.build_remove_members_and_invites_actions(
+                full_members,
+                pending,
+                revision,
+            )?)
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Sets the group title.
+    pub async fn set_group_title(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        title: &str,
+    ) -> Result<(), Error<S::Error>> {
+        self.modify_group(master_key_bytes, |_, operations, revision| {
+            Ok(operations.build_modify_title_actions(title, revision, &mut rng()))
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Sets the group description. `None` clears it.
+    pub async fn set_group_description(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        description: Option<&str>,
+    ) -> Result<(), Error<S::Error>> {
+        self.modify_group(master_key_bytes, |_, operations, revision| {
+            Ok(operations.build_modify_description_actions(
+                description,
+                revision,
+                &mut rng(),
+            ))
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Sets the disappearing-message timer. `None` disables it.
+    pub async fn set_group_timer(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        timer: Option<Timer>,
+    ) -> Result<(), Error<S::Error>> {
+        self.modify_group(master_key_bytes, |_, operations, revision| {
+            Ok(operations.build_modify_timer_actions(
+                timer.as_ref(),
+                revision,
+                &mut rng(),
+            ))
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Promotes a member to administrator, or demotes them to a regular member.
+    pub async fn set_group_member_role(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        aci: Aci,
+        role: Role,
+    ) -> Result<(), Error<S::Error>> {
+        self.modify_group(master_key_bytes, move |group, operations, revision| {
+            if !group.members.iter().any(|m| m.aci == aci) {
+                return Err(Error::UnknownRecipient);
+            }
+            Ok(operations.build_modify_member_role_actions(aci, role, revision)?)
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Accepts an outstanding invitation to a group.
+    ///
+    /// Promotes our own pending entry to full membership by presenting our
+    /// profile key credential. Fails with [`Error::UnknownGroup`] if we have no
+    /// pending invitation — including when we are already a full member.
+    pub async fn accept_group_invite(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+    ) -> Result<(), Error<S::Error>> {
+        let self_aci = self.state.data.service_ids.aci();
+        let self_service_id = ServiceId::from(self_aci);
+        let mut csprng = rng();
+
+        let self_profile_key = self
+            .store
+            .profile_key(&self_service_id)
+            .await?
+            .ok_or(Error::UnknownRecipient)?;
+
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let self_credential = groups_manager
+            .fetch_profile_key_credential(&mut csprng, self_aci, self_profile_key)
+            .await?
+            .ok_or(Error::UnknownRecipient)?;
+
+        let server_public_params = self
+            .state
+            .service_configuration()
+            .zkgroup_server_public_params;
+
+        self.modify_group(master_key_bytes, move |group, operations, revision| {
+            let invited = group
+                .members_pending_profile_key
+                .iter()
+                .any(|m| m.address == self_service_id);
+            if !invited {
+                return Err(Error::UnknownGroup);
+            }
+
+            Ok(operations.build_promote_pending_member_actions(
+                &server_public_params,
+                &self_credential,
+                revision,
+            ))
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// The canonical mutation path for group changes.
+    ///
+    /// Fetches authoritative state from the *server* (the local store may be
+    /// stale), lets `build` produce the actions for `revision + 1`, submits the
+    /// PATCH, then persists and announces the signed change.
+    ///
+    /// On a 409 the change raced another admin: state is refetched and `build`
+    /// re-run against the new revision, since replaying actions built on a
+    /// stale revision would only conflict again.
+    async fn modify_group<F>(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        build: F,
+    ) -> Result<libsignal_service::groups_v2::Group, Error<S::Error>>
+    where
+        F: Fn(
+            &libsignal_service::groups_v2::Group,
+            &GroupOperations,
+            u32,
+        ) -> Result<
+            libsignal_service::proto::group_change::Actions,
+            Error<S::Error>,
+        >,
+    {
+        /// Bounded: a group under constant concurrent modification should
+        /// surface the conflict rather than retry forever.
+        const MAX_ATTEMPTS: usize = 3;
+
+        let group_secret_params =
+            GroupSecretParams::derive_from_master_key(GroupMasterKey::new(*master_key_bytes));
+        let operations = GroupOperations::new(group_secret_params);
+        let mut csprng = rng();
+
+        let mut last_conflict = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut groups_manager = Box::pin(self.groups_manager()).await?;
+
+            // Always from the server: another client may have changed the
+            // group since we last synced. An Unauthorized here means we are
+            // not (or no longer) a member — group reads are authenticated with
+            // a membership proof — so report that rather than a bare auth
+            // failure, which reads as a credential problem.
+            let encrypted_group = match groups_manager
+                .fetch_encrypted_group(&mut csprng, master_key_bytes)
+                .await
+            {
+                Ok(encrypted_group) => encrypted_group,
+                Err(ServiceError::Unauthorized) => return Err(Error::NotAGroupMember),
+                Err(error) => return Err(error.into()),
+            };
+            let group = decrypt_group(master_key_bytes, encrypted_group)?;
+
+            let members_before: Vec<ServiceId> =
+                group.members.iter().map(|m| m.aci.into()).collect();
+
+            let revision = group.version + 1;
+            let actions = build(&group, &operations, revision)?;
+
+            // A change that resolves to nothing (every target already in the
+            // desired state) must not be submitted: the server accepts it and
+            // bumps the revision, announcing a no-op change to every member.
+            if is_empty_change(&actions) {
+                debug!("group change resolved to no actions, skipping");
+                return Ok(group);
+            }
+
+            match groups_manager
+                .patch_encrypted_group(&mut csprng, group_secret_params, actions)
+                .await
+            {
+                Ok(signed_change) => {
+                    // The change is committed server-side from here on. A
+                    // failure below must not be reported as a failed change.
+                    //
+                    // Refetching needs group membership to authenticate, so a
+                    // change that removed *us* (leaving) makes the group
+                    // unreadable: an Unauthorized here is the expected outcome,
+                    // not an error. In that case the pre-change state is the
+                    // last view we will ever have of the group.
+                    let updated = match self
+                        .refresh_group_after_change(master_key_bytes, &mut groups_manager)
+                        .await
+                    {
+                        Ok(updated) => Some(updated),
+                        Err(Error::ServiceError(ServiceError::Unauthorized)) => {
+                            debug!("group no longer readable after change, assuming self-removal");
+                            None
+                        }
+                        Err(error) => return Err(error),
+                    };
+
+                    // Removed members must hear about the change too, or their
+                    // clients keep showing a group they are no longer in.
+                    let members_after: Vec<ServiceId> = updated
+                        .as_ref()
+                        .map(|g| g.members.iter().map(|m| m.aci.into()).collect())
+                        .unwrap_or_default();
+                    let self_service_id = ServiceId::from(self.state.data.service_ids.aci());
+                    let recipients: Vec<ServiceId> = members_before
+                        .into_iter()
+                        .chain(members_after)
+                        .filter(|id| *id != self_service_id)
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+
+                    let change_bytes = signed_change.encode_to_vec();
+                    if let Err(error) = self
+                        .announce_group_change(
+                            master_key_bytes,
+                            revision,
+                            Some(change_bytes),
+                            recipients,
+                        )
+                        .await
+                    {
+                        warn!(%error, "group change applied but announcement failed");
+                    }
+
+                    // Report the post-change state when we can still read it;
+                    // otherwise the pre-change state, which is accurate as of
+                    // the moment before we removed ourselves.
+                    return Ok(updated.unwrap_or(group));
+                }
+                Err(ServiceError::GroupPatchConflict) => {
+                    debug!(attempt, "group change conflicted, rebuilding on newer revision");
+                    last_conflict = Some(ServiceError::GroupPatchConflict);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Err(last_conflict
+            .map(Error::from)
+            .unwrap_or(Error::UnknownGroup))
+    }
+
+    /// Refetches group state after a successful change and saves it.
+    async fn refresh_group_after_change(
+        &self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    ) -> Result<libsignal_service::groups_v2::Group, Error<S::Error>> {
+        let encrypted_group = groups_manager
+            .fetch_encrypted_group(&mut rng(), master_key_bytes)
+            .await?;
+        let group = decrypt_group(master_key_bytes, encrypted_group)?;
+        self.store
+            .save_group(*master_key_bytes, group.clone())
+            .await?;
+        Ok(group)
+    }
+
+    /// Announces a group change to `recipients` as an empty data message
+    /// carrying only the group context.
+    ///
+    /// This is the standard "group update" message. Unlike a normal group send
+    /// it deliberately skips expire-timer autofill: a group update is not a
+    /// chat message and must not carry or reset the disappearing timer.
+    async fn announce_group_change(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        revision: u32,
+        group_change: Option<Vec<u8>>,
+        recipients: Vec<ServiceId>,
+    ) -> Result<(), Error<S::Error>> {
+        if recipients.is_empty() {
+            return Ok(());
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_millis() as u64;
+
+        let content_body: ContentBody = DataMessage {
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(master_key_bytes.to_vec()),
+                revision: Some(revision),
+                group_change,
+            }),
+            timestamp: Some(timestamp),
+            ..Default::default()
+        }
+        .into();
+
+        let sender_certificate = self.sender_certificate().await?;
+        let mut sender = self.new_message_sender().await?;
+
+        let mut targets = Vec::new();
+        for service_id in recipients {
+            let unidentified_access = self
+                .store
+                .profile_key(&service_id)
+                .await?
+                .map(|profile_key| UnidentifiedAccess {
+                    key: profile_key.derive_access_key().to_vec(),
+                    certificate: sender_certificate.clone(),
+                });
+            targets.push((service_id, unidentified_access, false));
+        }
+
+        let online_only = false;
+        let results = sender
+            .send_message_to_group(targets, content_body, timestamp, online_only)
+            .await;
+
+        // A member who deleted their account should not fail the announcement
+        // for everyone else.
+        results
+            .into_iter()
+            .find(|res| match res {
+                Ok(_) => false,
+                Err(MessageSenderError::NotFound { service_id }) => {
+                    debug!(
+                        service_id = %service_id.service_id_string(),
+                        "recipient not found, skipping group announcement result"
+                    );
+                    false
+                }
+                Err(_) => true,
+            })
+            .transpose()?;
+
+        Ok(())
+    }
+
     /// Sends one message in a group (v2). The `master_key_bytes` is required to have 32 elements.
     ///
     /// This method will automatically update the [DataMessage::expire_timer] if it is set to
@@ -1859,6 +2523,81 @@ fn ensure_data_message_timestamp(content_body: &mut ContentBody, timestamp: u64)
     }
 }
 
+/// Whether an [`Actions`] envelope carries no actual change.
+///
+/// Submitting one is not an error server-side — it is accepted, bumps the
+/// revision and announces a no-op to every member — so mutators that filter
+/// their targets against current state can end up with nothing to do and must
+/// be short-circuited before the PATCH.
+///
+/// Every action field is checked explicitly rather than comparing against a
+/// default envelope, because `version` is always set and would make a default
+/// comparison never match.
+///
+/// [`Actions`]: libsignal_service::proto::group_change::Actions
+fn is_empty_change(actions: &libsignal_service::proto::group_change::Actions) -> bool {
+    actions.add_members.is_empty()
+        && actions.delete_members.is_empty()
+        && actions.modify_member_roles.is_empty()
+        && actions.modify_member_profile_keys.is_empty()
+        && actions.add_members_pending_profile_key.is_empty()
+        && actions.delete_members_pending_profile_key.is_empty()
+        && actions.promote_members_pending_profile_key.is_empty()
+        && actions.add_members_pending_admin_approval.is_empty()
+        && actions.delete_members_pending_admin_approval.is_empty()
+        && actions.promote_members_pending_admin_approval.is_empty()
+        && actions.add_members_banned.is_empty()
+        && actions.delete_members_banned.is_empty()
+        && actions
+            .promote_members_pending_pni_aci_profile_key
+            .is_empty()
+        && actions.modify_member_labels.is_empty()
+        && actions.modify_title.is_none()
+        && actions.modify_avatar.is_none()
+        && actions.modify_disappearing_message_timer.is_none()
+        && actions.modify_attributes_access.is_none()
+        && actions.modify_member_access.is_none()
+        && actions.modify_add_from_invite_link_access.is_none()
+        && actions.modify_invite_link_password.is_none()
+        && actions.modify_description.is_none()
+        && actions.modify_announcements_only.is_none()
+        && actions.modify_member_label_access.is_none()
+}
+
+/// Whether `self_aci` leaving would strand the group without an administrator.
+///
+/// True only when others would remain *and* we are the sole admin. Both halves
+/// matter:
+///
+/// - If nobody else remains, an admin-less group is harmless — it is empty.
+/// - We must check that we actually hold admin, not merely that no *other*
+///   admin exists: a group whose admin already left has no admins at all, and
+///   a plain member leaving it should not be blocked.
+///
+/// Pending members (invited but not yet accepted) count as "others remaining".
+/// They can still accept the invite, and would land in a group nobody can
+/// administer — verified against the live server, which happily allows the
+/// sole admin of an invite-only group to walk away.
+fn would_orphan_group(
+    members: &[libsignal_service::groups_v2::Member],
+    pending_members: &[libsignal_service::groups_v2::PendingMember],
+    self_aci: Aci,
+) -> bool {
+    let self_service_id = ServiceId::from(self_aci);
+    let others_remain = members.iter().any(|m| m.aci != self_aci)
+        || pending_members
+            .iter()
+            .any(|m| m.address != self_service_id);
+    let self_is_admin = members
+        .iter()
+        .any(|m| m.aci == self_aci && m.role == Role::Administrator);
+    let no_other_admin = !members
+        .iter()
+        .any(|m| m.aci != self_aci && m.role == Role::Administrator);
+
+    others_remain && self_is_admin && no_other_admin
+}
+
 async fn upsert_group<S: Store>(
     store: &S,
     groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
@@ -2287,4 +3026,106 @@ async fn register_pre_keys<S: Store>(
 
     trace!("registered pre keys");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libsignal_service::groups_v2::{Member, PendingMember};
+
+    fn aci(last: u8) -> Aci {
+        let mut bytes = [0u8; 16];
+        bytes[15] = last;
+        Aci::from(Uuid::from_bytes(bytes))
+    }
+
+    fn member(last: u8, role: Role) -> Member {
+        Member {
+            aci: aci(last),
+            role,
+            profile_key: ProfileKey::create([0u8; 32]),
+            joined_at_version: 0,
+            label: None,
+            label_emoji: None,
+        }
+    }
+
+    fn pending(last: u8) -> PendingMember {
+        PendingMember {
+            address: ServiceId::from(aci(last)),
+            role: Role::Default,
+            added_by_aci: aci(1),
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn empty_change_is_detected_but_a_real_one_is_not() {
+        use libsignal_service::proto::group_change::Actions;
+
+        // `version` alone is not a change — it is set on every envelope.
+        let empty = Actions {
+            version: 7,
+            ..Default::default()
+        };
+        assert!(is_empty_change(&empty));
+
+        // A repeated field carrying one entry is a real change.
+        let with_removal = Actions {
+            version: 7,
+            delete_members: vec![Default::default()],
+            ..Default::default()
+        };
+        assert!(!is_empty_change(&with_removal));
+
+        // As is a singular field being present at all.
+        let with_title = Actions {
+            version: 7,
+            modify_title: Some(Default::default()),
+            ..Default::default()
+        };
+        assert!(!is_empty_change(&with_title));
+    }
+
+    #[test]
+    fn sole_admin_leaving_others_behind_orphans_the_group() {
+        let members = vec![
+            member(1, Role::Administrator),
+            member(2, Role::Default),
+        ];
+        assert!(would_orphan_group(&members, &[], aci(1)));
+    }
+
+    #[test]
+    fn sole_admin_leaving_a_pending_invitee_behind_orphans_the_group() {
+        // Regression, caught against the live server: an invitee is not in
+        // `members` yet, but can still accept and land in a group nobody can
+        // administer.
+        let members = vec![member(1, Role::Administrator)];
+        assert!(would_orphan_group(&members, &[pending(2)], aci(1)));
+    }
+
+    #[test]
+    fn leaving_is_fine_when_another_admin_remains() {
+        let members = vec![
+            member(1, Role::Administrator),
+            member(2, Role::Administrator),
+        ];
+        assert!(!would_orphan_group(&members, &[], aci(1)));
+    }
+
+    #[test]
+    fn last_member_leaving_never_orphans() {
+        // An admin-less empty group harms nobody.
+        let members = vec![member(1, Role::Administrator)];
+        assert!(!would_orphan_group(&members, &[], aci(1)));
+    }
+
+    #[test]
+    fn plain_member_is_not_blocked_by_an_already_adminless_group() {
+        // Regression: "no other admin exists" is vacuously true here, so a
+        // check that omitted "are we actually an admin" would wrongly refuse.
+        let members = vec![member(1, Role::Default), member(2, Role::Default)];
+        assert!(!would_orphan_group(&members, &[], aci(1)));
+    }
 }

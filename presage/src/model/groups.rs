@@ -22,7 +22,7 @@ fn default_access_required() -> AccessRequired {
     AccessRequired::Member
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
     pub title: String,
     pub avatar: String,
@@ -47,7 +47,7 @@ pub struct Member {
     pub label_emoji: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PendingMember {
     // for backwards compatibility
     pub uuid: Uuid,

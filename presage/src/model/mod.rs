@@ -6,7 +6,7 @@ pub mod groups;
 pub mod identity;
 pub mod messages;
 
-#[derive(Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub enum ServiceIdType {
     /// Account Identity (ACI)
     ///
