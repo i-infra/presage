@@ -74,6 +74,12 @@ pub enum Error<S: std::error::Error> {
     /// not a member — typically because we already left.
     #[error("not a member of this group")]
     NotAGroupMember,
+    #[error("invalid group invite link: {0}")]
+    InvalidInviteLink(#[from] libsignal_service::groups_v2::InviteLinkError),
+    /// The link's group refused it: links are disabled or the password was
+    /// rotated since the link was shared.
+    #[error("group invite link is no longer valid")]
+    InviteLinkRevoked,
     #[error("timeout: {0}")]
     Timeout(#[from] tokio::time::error::Elapsed),
     #[error("store error: {0}")]

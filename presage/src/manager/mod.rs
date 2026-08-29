@@ -10,7 +10,8 @@ use std::fmt;
 pub use self::confirmation::Confirmation;
 pub use self::linking::Linking;
 pub use self::registered::{
-    AvatarUpdate, Registered, RegistrationData, RegistrationType,
+    AvatarUpdate, GroupInviteLinkAccess, JoinGroupOutcome, Registered, RegistrationData,
+    RegistrationType,
 };
 pub use self::registration::{Registration, RegistrationOptions};
 
