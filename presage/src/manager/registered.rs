@@ -1407,11 +1407,9 @@ impl<S: Store> Manager<S, Registered> {
             GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key_bytes));
 
         let self_aci = self.state.data.service_ids.aci();
-        let self_profile_key = self
-            .store
-            .profile_key(&self_aci.into())
-            .await?
-            .ok_or(Error::UnknownRecipient)?;
+        // Our own key comes from registration data: the profile-key table
+        // only learns it on linked devices, never on a fresh primary.
+        let self_profile_key = self.state.data.profile_key;
 
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
 
@@ -1801,11 +1799,9 @@ impl<S: Store> Manager<S, Registered> {
         let self_service_id = ServiceId::from(self_aci);
         let mut csprng = rng();
 
-        let self_profile_key = self
-            .store
-            .profile_key(&self_service_id)
-            .await?
-            .ok_or(Error::UnknownRecipient)?;
+        // Our own key comes from registration data: the profile-key table
+        // only learns it on linked devices, never on a fresh primary.
+        let self_profile_key = self.state.data.profile_key;
 
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
         let self_credential = self
@@ -2046,11 +2042,9 @@ impl<S: Store> Manager<S, Registered> {
             }
         }
 
-        let self_profile_key = self
-            .store
-            .profile_key(&self_aci.into())
-            .await?
-            .ok_or(Error::UnknownRecipient)?;
+        // Our own key comes from registration data: the profile-key table
+        // only learns it on linked devices, never on a fresh primary.
+        let self_profile_key = self.state.data.profile_key;
         let self_credential = self
             .profile_key_credential(&mut groups_manager, &mut csprng, self_aci, self_profile_key)
             .await?
