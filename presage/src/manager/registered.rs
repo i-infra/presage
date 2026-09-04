@@ -1845,6 +1845,7 @@ impl<S: Store> Manager<S, Registered> {
     ) -> Result<(), Error<S::Error>> {
         let self_aci = self.state.data.service_ids.aci();
         let self_service_id = ServiceId::from(self_aci);
+        let self_pni_id = ServiceId::from(self.state.data.service_ids.pni());
         let mut csprng = rng();
 
         // Our own key comes from registration data: the profile-key table
@@ -1863,22 +1864,143 @@ impl<S: Store> Manager<S, Registered> {
             .zkgroup_server_public_params;
 
         self.modify_group(master_key_bytes, move |group, operations, revision| {
-            let invited = group
-                .members_pending_profile_key
-                .iter()
-                .any(|m| m.address == self_service_id);
-            if !invited {
-                return Err(Error::UnknownGroup);
+            // An invite can be addressed to our ACI or — when the inviter
+            // only knew our phone number — to our PNI. Different promote
+            // actions, same presentation.
+            let pending = &group.members_pending_profile_key;
+            if pending.iter().any(|m| m.address == self_service_id) {
+                Ok(operations.build_promote_pending_member_actions(
+                    &server_public_params,
+                    &self_credential,
+                    revision,
+                ))
+            } else if pending.iter().any(|m| m.address == self_pni_id) {
+                Ok(operations.build_promote_pending_pni_member_actions(
+                    &server_public_params,
+                    &self_credential,
+                    revision,
+                ))
+            } else {
+                Err(Error::UnknownGroup)
             }
-
-            Ok(operations.build_promote_pending_member_actions(
-                &server_public_params,
-                &self_credential,
-                revision,
-            ))
         })
         .await?;
 
+        Ok(())
+    }
+
+    /// Fetches the group's authoritative state from the server, saving it
+    /// locally. Unlike the store view this includes banned members and the
+    /// announcements-only flag.
+    pub async fn fetch_group(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+    ) -> Result<libsignal_service::groups_v2::Group, Error<S::Error>> {
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let encrypted = match groups_manager
+            .fetch_encrypted_group(&mut rng(), master_key_bytes)
+            .await
+        {
+            Ok(encrypted) => encrypted,
+            Err(ServiceError::Unauthorized) => return Err(Error::NotAGroupMember),
+            Err(error) => return Err(error.into()),
+        };
+        let group = decrypt_group(master_key_bytes, encrypted)?;
+        self.store
+            .save_group(*master_key_bytes, group.clone())
+            .await?;
+        Ok(group)
+    }
+
+    /// Sets who may edit group attributes (title, description, avatar,
+    /// timer): every member, or administrators only.
+    pub async fn set_group_attributes_access(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        access: AccessRequired,
+    ) -> Result<(), Error<S::Error>> {
+        self.modify_group(master_key_bytes, |group, operations, revision| {
+            let current = group.access_control.as_ref().map(|ac| ac.attributes);
+            if current == Some(access) {
+                return Ok(operations.build_actions(revision));
+            }
+            Ok(operations.build_modify_attributes_access_actions(access, revision))
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Sets who may edit membership: every member, or administrators only.
+    pub async fn set_group_members_access(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        access: AccessRequired,
+    ) -> Result<(), Error<S::Error>> {
+        self.modify_group(master_key_bytes, |group, operations, revision| {
+            let current = group.access_control.as_ref().map(|ac| ac.members);
+            if current == Some(access) {
+                return Ok(operations.build_actions(revision));
+            }
+            Ok(operations.build_modify_members_access_actions(access, revision))
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Toggles announcements-only mode (admins only may send). The flag is
+    /// enforced by clients, not by message delivery; changing it needs
+    /// admin rights on the group.
+    pub async fn set_group_announcements_only(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        announcements_only: bool,
+    ) -> Result<(), Error<S::Error>> {
+        self.modify_group(master_key_bytes, |group, operations, revision| {
+            if group.announcements_only == announcements_only {
+                return Ok(operations.build_actions(revision));
+            }
+            Ok(operations.build_modify_announcements_only_actions(announcements_only, revision))
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Bans service ids from rejoining through an invite link (admin only).
+    /// Does not remove current members; already-banned ids are skipped.
+    pub async fn ban_group_members(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        service_ids: impl IntoIterator<Item = ServiceId>,
+    ) -> Result<(), Error<S::Error>> {
+        let requested: Vec<ServiceId> = service_ids.into_iter().collect();
+        self.modify_group(master_key_bytes, |group, operations, revision| {
+            let new: Vec<ServiceId> = requested
+                .iter()
+                .copied()
+                .filter(|id| !group.members_banned.iter().any(|b| b.user_id == *id))
+                .collect();
+            Ok(operations.build_ban_members_actions(new, revision)?)
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Lifts bans (admin only). Ids that are not banned are skipped.
+    pub async fn unban_group_members(
+        &mut self,
+        master_key_bytes: &GroupMasterKeyBytes,
+        service_ids: impl IntoIterator<Item = ServiceId>,
+    ) -> Result<(), Error<S::Error>> {
+        let requested: Vec<ServiceId> = service_ids.into_iter().collect();
+        self.modify_group(master_key_bytes, |group, operations, revision| {
+            let banned: Vec<ServiceId> = requested
+                .iter()
+                .copied()
+                .filter(|id| group.members_banned.iter().any(|b| b.user_id == *id))
+                .collect();
+            Ok(operations.build_unban_members_actions(banned, revision)?)
+        })
+        .await?;
         Ok(())
     }
 
